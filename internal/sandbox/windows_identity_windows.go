@@ -102,6 +102,7 @@ func (role windowsSandboxRole) roleTag() string {
 const (
 	nerrSuccess         = 0
 	nerrGroupExists     = 2223
+	nerrGroupNotFound   = 2220
 	nerrUserExists      = 2224
 	errorAliasExists    = 1379
 	errorMemberInAlias  = 1378
@@ -122,6 +123,7 @@ var (
 	netapi32                    = windows.NewLazySystemDLL("netapi32.dll")
 	procNetUserAdd              = netapi32.NewProc("NetUserAdd")
 	procNetLocalGroupAdd        = netapi32.NewProc("NetLocalGroupAdd")
+	procNetLocalGroupGetInfo    = netapi32.NewProc("NetLocalGroupGetInfo")
 	procNetLocalGroupAddMembers = netapi32.NewProc("NetLocalGroupAddMembers")
 	procNetUserDel              = netapi32.NewProc("NetUserDel")
 	procNetUserSetInfo          = netapi32.NewProc("NetUserSetInfo")
@@ -303,13 +305,47 @@ func resolveWindowsSandboxOfflineGroupSID() (string, error) {
 // ensureWindowsLocalGroup creates a local group, or leaves it alone when it
 // already exists.
 func ensureWindowsLocalGroup(groupName string, groupComment string) error {
-	name, err := windows.UTF16PtrFromString(groupName)
+	status, err := addWindowsLocalGroupFn(groupName, groupComment)
 	if err != nil {
 		return err
 	}
+	if status == nerrGroupExists || status == errorAliasExists {
+		// A group with this name already exists, which is the normal re-run case
+		// — but only if it is OURS. The offline group's SID is installed on the
+		// persistent WFP deny filters and the sandbox principal is made a member
+		// of it, so silently adopting a same-named group created by some other
+		// tool or by policy would cut off every existing member's outbound
+		// traffic and hand our principal that group's permissions.
+		owned, err := windowsLocalGroupOwnedByZeroFn(groupName, groupComment)
+		if err != nil {
+			return err
+		}
+		if !owned {
+			return fmt.Errorf("local group %q already exists and is not managed by zero; "+
+				"rename or remove it before running sandbox setup", groupName)
+		}
+		return nil
+	}
+	return netAPIStatus("NetLocalGroupAdd", status)
+}
+
+// Seams for the two Win32 calls behind group creation, so the already-exists
+// branch is reachable in tests without an elevated machine.
+var (
+	addWindowsLocalGroupFn         = addWindowsLocalGroup
+	windowsLocalGroupOwnedByZeroFn = windowsLocalGroupOwnedByZero
+)
+
+// addWindowsLocalGroup issues NetLocalGroupAdd and hands back its raw status so
+// the caller can distinguish "already exists" from a real failure.
+func addWindowsLocalGroup(groupName string, groupComment string) (uintptr, error) {
+	name, err := windows.UTF16PtrFromString(groupName)
+	if err != nil {
+		return 0, err
+	}
 	comment, err := windows.UTF16PtrFromString(groupComment)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	info := localGroupInfo1{Name: name, Comment: comment}
 	status, _, _ := procNetLocalGroupAdd.Call(
@@ -323,7 +359,42 @@ func ensureWindowsLocalGroup(groupName string, groupComment string) error {
 	runtime.KeepAlive(info)
 	runtime.KeepAlive(name)
 	runtime.KeepAlive(comment)
-	return netAPIStatus("NetLocalGroupAdd", status, nerrGroupExists, errorAliasExists)
+	return status, nil
+}
+
+// windowsLocalGroupOwnedByZero reports whether an existing local group carries
+// the managed-group marker this setup writes, so a foreign group that merely
+// shares the name is never adopted.
+func windowsLocalGroupOwnedByZero(groupName string, wantComment string) (bool, error) {
+	name, err := windows.UTF16PtrFromString(groupName)
+	if err != nil {
+		return false, err
+	}
+	var buffer *byte
+	status, _, _ := procNetLocalGroupGetInfo.Call(
+		0, // local machine
+		uintptr(unsafe.Pointer(name)),
+		1, // level: LOCALGROUP_INFO_1
+		uintptr(unsafe.Pointer(&buffer)),
+	)
+	runtime.KeepAlive(name)
+	if status == nerrGroupNotFound {
+		// It existed a moment ago and does not now. Treat that as not-ours
+		// rather than guessing; the next setup run recreates it cleanly.
+		return false, nil
+	}
+	if err := netAPIStatus("NetLocalGroupGetInfo", status); err != nil {
+		return false, err
+	}
+	if buffer == nil {
+		return false, nil
+	}
+	defer procNetApiBufferFree.Call(uintptr(unsafe.Pointer(buffer)))
+	info := (*localGroupInfo1)(unsafe.Pointer(buffer))
+	if info.Comment == nil {
+		return false, nil
+	}
+	return windows.UTF16PtrToString(info.Comment) == wantComment, nil
 }
 
 // ensureWindowsSandboxUser creates a sandbox account with the supplied password.
