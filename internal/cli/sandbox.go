@@ -20,7 +20,7 @@ type sandboxCommandOptions struct {
 
 func runSandbox(args []string, stdout io.Writer, stderr io.Writer, deps appDeps) int {
 	if len(args) == 0 {
-		return writeExecUsageError(stderr, "sandbox subcommand required. Use `zero sandbox policy` or `zero sandbox grants list`.")
+		return writeExecUsageError(stderr, "sandbox subcommand required. Use `zero sandbox policy`, `zero sandbox exec`, or `zero sandbox grants list`.")
 	}
 	switch args[0] {
 	case "-h", "--help", "help":
@@ -34,6 +34,8 @@ func runSandbox(args []string, stdout io.Writer, stderr io.Writer, deps appDeps)
 		return runSandboxSetup(args[1:], stdout, stderr, deps)
 	case "check":
 		return runSandboxCheck(args[1:], stdout, stderr, deps)
+	case "exec":
+		return runSandboxExec(args[1:], stdout, stderr, deps)
 	case "grants":
 		return runSandboxGrants(args[1:], stdout, stderr, deps)
 	default:
@@ -639,6 +641,7 @@ Commands:
   policy      Inspect active sandbox policy and platform backend
   setup       Run native platform sandbox setup
   check       Evaluate the sandbox decision for a hypothetical tool action
+  exec        Run one command through the real sandbox
   grants      Manage persistent sandbox grants
 
 `)
