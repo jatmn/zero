@@ -104,7 +104,7 @@ func windowsSandboxPrincipalToken(config WindowsSandboxCommandConfig) (windows.T
 		// surface read once — `zero doctor`, which carries the opt-in now.
 		return 0, false, nil
 	}
-	key := windowsSandboxWorkspaceKey(config.WorkspaceRoots)
+	key := windowsSandboxPrincipalKey(config.WorkspaceRoots)
 	// The network mode picks the principal. Both are provisioned by setup; the
 	// offline one is in the group the block filters match, so choosing here is
 	// what enforces the mode.
@@ -236,7 +236,7 @@ var (
 // that fails partway leaves a principal that can at least be logged on and
 // therefore cleaned up, rather than an account nothing holds the secret for.
 func provisionWindowsSandboxPrincipalForSetup(config WindowsSandboxCommandConfig, role windowsSandboxRole) (windowsSandboxIdentity, bool, error) {
-	key := windowsSandboxWorkspaceKey(config.WorkspaceRoots)
+	key := windowsSandboxPrincipalKey(config.WorkspaceRoots)
 	identity, password, created, err := provisionWindowsSandboxIdentityFn(key, role)
 
 	// Undo whatever this run actually did, in reverse, on any failure after the
@@ -351,7 +351,7 @@ func provisionWindowsSandboxPrincipalForSetup(config WindowsSandboxCommandConfig
 // naming a SID that no longer resolves, which is the orphaned-entry residue this
 // model exists to avoid.
 func setupWindowsSandboxPrincipal(config WindowsSandboxCommandConfig) (func() error, error) {
-	key := windowsSandboxWorkspaceKey(config.WorkspaceRoots)
+	key := windowsSandboxPrincipalKey(config.WorkspaceRoots)
 	// Both roles are provisioned regardless of the profile this setup ran with.
 	// Setup needs elevation and a command does not, so a command whose network
 	// mode differs from the one setup happened to see must still find a principal
@@ -473,7 +473,7 @@ func setupWindowsSandboxPrincipal(config WindowsSandboxCommandConfig) (func() er
 // under its own record, so retiring both because one lost its record would
 // destroy a principal there is nothing wrong with.
 func retireUnrecordedWindowsSandboxPrincipal(config WindowsSandboxCommandConfig, role windowsSandboxRole) error {
-	_, err := lookupWindowsSandboxIdentityFn(windowsSandboxWorkspaceKey(config.WorkspaceRoots), role)
+	_, err := lookupWindowsSandboxIdentityFn(windowsSandboxPrincipalKey(config.WorkspaceRoots), role)
 	if err != nil {
 		if errors.Is(err, errWindowsSandboxIdentityUnavailable) {
 			return nil
@@ -488,7 +488,7 @@ func retireUnrecordedWindowsSandboxPrincipal(config WindowsSandboxCommandConfig,
 // then the account itself. Everything keyed to the SID has to go while the SID
 // still resolves.
 func removeWindowsSandboxPrincipalForSetup(config WindowsSandboxCommandConfig, role windowsSandboxRole) error {
-	key := windowsSandboxWorkspaceKey(config.WorkspaceRoots)
+	key := windowsSandboxPrincipalKey(config.WorkspaceRoots)
 	username := windowsSandboxUserName(key, role)
 	secretPath, err := windowsSandboxSecretPath(config.SandboxHome, username)
 	if err != nil {
@@ -816,6 +816,23 @@ func applyWindowsPrincipalACLs(sandboxHome string, username string, principalSID
 		if restoreRevoked != nil {
 			restoreErr = restoreRevoked()
 		}
+		// THE LEDGER HAS TO COME BACK TOO.
+		//
+		// The narrowed set was written above only once everything had succeeded.
+		// This closure puts the old ACEs back, so leaving that narrowed ledger in
+		// place describes a principal holding ACEs the ledger does not name, and
+		// a later setup or teardown reads the ledger to decide what to revoke.
+		// The restored paths would never be revisited: access outside the current
+		// policy, held by an account nothing knows to clean up.
+		//
+		// The union is what was recorded before any DACL changed, so writing it
+		// back returns the ledger to the state the restored ACEs belong to.
+		// Over-recording is the safe direction: a path named but no longer held
+		// costs one redundant revoke, while a path held but unnamed is residue
+		// nothing can find.
+		if ledgerErr := writeWindowsPrincipalACLLedger(sandboxHome, username, stale); ledgerErr != nil {
+			restoreErr = errors.Join(restoreErr, ledgerErr)
+		}
 		if grantErr != nil {
 			return grantErr
 		}
@@ -871,7 +888,7 @@ func windowsPrincipalRevocationPaths(config WindowsSandboxCommandConfig, princip
 	// This role's record, not the workspace's: the other role is a separate
 	// trustee whose recorded paths are none of this revocation's business.
 	recorded, _ := readWindowsPrincipalACLLedger(
-		config.SandboxHome, windowsSandboxUserName(windowsSandboxWorkspaceKey(config.WorkspaceRoots), role))
+		config.SandboxHome, windowsSandboxUserName(windowsSandboxPrincipalKey(config.WorkspaceRoots), role))
 	return unionWindowsPrincipalACLPaths(recorded, current), nil
 }
 
@@ -959,4 +976,35 @@ func removeWindowsSandboxPrincipalsForSetup(config WindowsSandboxCommandConfig) 
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// windowsSandboxPrincipalKey derives the key a principal ACCOUNT is named after,
+// scoped to the invoking user as well as the workspace.
+//
+// The workspace alone is not enough. The account name is machine-wide, but its
+// DPAPI secret and its ACL ledger both live under the invoking user's sandbox
+// home, so two Windows users sharing one workspace path derive the same account
+// while keeping private bookkeeping for it. The second user finds an account
+// with no ledger of their own and either retires the first user's working
+// principal or adopts it and rotates its password while storing only their own
+// secret. Either way the first user's marker still validates and their next
+// command cannot log on.
+//
+// Deliberately NOT used for the setup lock, which stays keyed to the workspace
+// alone. Two users setting up one shared workspace still write DACLs on the same
+// paths, so they must continue to serialize against each other even though they
+// now provision separate accounts.
+//
+// Falls back to the workspace-only key when the token user cannot be read. That
+// is the pre-existing behaviour rather than a new failure mode, and refusing to
+// derive a name at all would break setup on a machine whose token query fails
+// for unrelated reasons.
+func windowsSandboxPrincipalKey(workspaceRoots []string) string {
+	workspace := windowsSandboxWorkspaceKey(workspaceRoots)
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil || user == nil || user.User.Sid == nil {
+		return workspace
+	}
+	digest := sha256.Sum256([]byte(workspace + "\x00" + user.User.Sid.String()))
+	return hex.EncodeToString(digest[:])
 }
